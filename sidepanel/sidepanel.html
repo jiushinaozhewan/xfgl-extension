@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>学分查询自动化</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      width: 380px;
+      min-height: 600px;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 16px;
+      font-size: 14px;
+    }
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .section-title {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: #aaa;
+      margin-bottom: 6px;
+    }
+    select, textarea {
+      width: 100%;
+      background: #0f3460;
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: #e0e0e0;
+      padding: 8px 10px;
+      font-size: 13px;
+      outline: none;
+    }
+    select:focus, textarea:focus {
+      border-color: #e94560;
+    }
+    textarea {
+      height: 120px;
+      resize: vertical;
+      font-family: monospace;
+    }
+    .hint {
+      margin-top: 6px;
+      font-size: 11px;
+      line-height: 1.5;
+      color: #888;
+    }
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    button {
+      flex: 1;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: #e94560;
+      color: #fff;
+    }
+    .btn-primary:hover { background: #ff6b6b; }
+    .btn-primary:disabled { background: #555; cursor: not-allowed; }
+    .btn-secondary {
+      background: #0f3460;
+      color: #e0e0e0;
+    }
+    .btn-secondary:hover { background: #1a4a7a; }
+    .btn-stop {
+      background: #dc3545;
+      color: #fff;
+    }
+    .btn-stop:hover { background: #ff4757; }
+    .log-container {
+      background: #0a0a1a;
+      border-radius: 8px;
+      padding: 12px;
+      height: 200px;
+      overflow-y: auto;
+      font-family: 'Consolas', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .log-entry { margin-bottom: 4px; }
+    .log-info { color: #888; }
+    .log-ok { color: #51cf66; }
+    .log-warn { color: #ffc107; }
+    .log-error { color: #ff6b6b; }
+    .progress-bar {
+      height: 6px;
+      background: #333;
+      border-radius: 3px;
+      margin-top: 10px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #e94560, #ff6b6b);
+      border-radius: 3px;
+      transition: width 0.3s;
+    }
+    .status-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #888;
+      margin-top: 8px;
+    }
+    .result-summary {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .stat-box {
+      background: #0f3460;
+      border-radius: 6px;
+      padding: 8px;
+      text-align: center;
+    }
+    .stat-num {
+      font-size: 20px;
+      font-weight: 700;
+    }
+    .stat-label {
+      font-size: 11px;
+      color: #888;
+    }
+    .stat-success .stat-num { color: #51cf66; }
+    .stat-fail .stat-num { color: #ff6b6b; }
+    .stat-pending .stat-num { color: #ffc107; }
+  </style>
+</head>
+<body>
+  <h1>📚 学分查询自动化</h1>
+
+  <div class="section">
+    <div class="section-title">查询配置</div>
+    <label>查询类型</label>
+    <select id="queryType">
+      <option value="姓名">姓名</option>
+      <option value="学生标识码">学生标识码</option>
+      <option value="身份证件号">身份证件号</option>
+    </select>
+
+    <div style="display:flex;gap:10px;margin-top:12px;">
+      <div style="flex:1;">
+        <label>循环间隔（秒）</label>
+        <input type="number" id="intervalInput" value="3" min="0" max="30" style="width:100%;background:#0f3460;border:1px solid #333;border-radius:6px;color:#e0e0e0;padding:8px 10px;font-size:13px;outline:none;">
+      </div>
+    </div>
+
+    <label style="margin-top: 12px;">打印方式</label>
+    <select id="printMode">
+      <option value="kiosk">自动打印（推荐，需 --kiosk-printing）</option>
+      <option value="manual">手动确认（仅点到“点击打印”）</option>
+    </select>
+    <div class="hint">
+      最终“打印”按钮是 Chrome 打印预览里的 <code>cr-button.action-button</code>，扩展无法直接点击。
+      若要全自动，请用带 <code>--kiosk-printing</code> 的 Chrome/Edge 启动。
+    </div>
+
+    <label style="margin-top: 12px;">数据列表（每行一个）</label>
+    <textarea id="dataInput" placeholder="粘贴数据，例如：&#10;张三&#10;李四&#10;王五"></textarea>
+
+    <div class="btn-row">
+      <button class="btn-primary" id="btnStart">▶ 开始</button>
+      <button class="btn-stop" id="btnStop" disabled>⏹ 停止</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">进度</div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+    </div>
+    <div class="status-row">
+      <span id="statusText">等待开始</span>
+      <span id="progressText">0 / 0</span>
+    </div>
+    <div class="result-summary">
+      <div class="stat-box stat-success">
+        <div class="stat-num" id="statSuccess">0</div>
+        <div class="stat-label">成功</div>
+      </div>
+      <div class="stat-box stat-fail">
+        <div class="stat-num" id="statFail">0</div>
+        <div class="stat-label">失败</div>
+      </div>
+      <div class="stat-box stat-pending">
+        <div class="stat-num" id="statPending">0</div>
+        <div class="stat-label">待处理</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">日志</div>
+    <div class="log-container" id="logContainer">
+      <div class="log-entry log-info">等待启动...</div>
+    </div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
