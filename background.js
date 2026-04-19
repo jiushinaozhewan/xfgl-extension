@@ -1,24 +1,133 @@
 // background.js — XFGL 学分查询自动化扩展后台服务
 
+importScripts("lib/queue-state.js");
+
 const TARGET_URL =
   "http://xsgl.jyt.henan.gov.cn/xfgl/credit/newsubject/newsubjectBF";
 const SITE_URL_PATTERN = "http://xsgl.jyt.henan.gov.cn/*";
+const STORAGE_KEY = "state";
 
-// 状态管理
-let state = {
-  step: "idle",
-  dataList: [],
-  currentIndex: 0,
-  queryType: "姓名",
-  printMode: "kiosk",
-  results: [],
-  tabId: null,
-  detailTabId: null,
-  printTabId: null,
-  isRunning: false,
-  isPaused: false,
-  intervalMs: 3000, // 循环间隔（毫秒）
-};
+const {
+  createQueueState,
+  getCurrentItem,
+  getQueueProgress,
+  markCurrentItemRetry,
+  markCurrentItemSuccess,
+  normalizeItems,
+  normalizeQueueState,
+} = globalThis.QueueState;
+
+function createInitialState() {
+  return {
+    step: "idle",
+    pendingItems: [],
+    successItems: [],
+    retryItems: [],
+    dataList: [],
+    currentIndex: 0,
+    queryType: "姓名",
+    printMode: "kiosk",
+    results: [],
+    tabId: null,
+    detailTabId: null,
+    printTabId: null,
+    isRunning: false,
+    isPaused: false,
+    intervalMs: 3000, // 循环间隔（毫秒）
+  };
+}
+
+let state = createInitialState();
+
+function syncDerivedState() {
+  const normalizedState = normalizeQueueState(state);
+  const progress = getQueueProgress(normalizedState);
+
+  state = {
+    ...state,
+    ...normalizedState,
+    currentIndex: progress.done,
+    dataList: [
+      ...normalizedState.successItems,
+      ...normalizedState.retryItems.map((entry) => entry.item),
+      ...normalizedState.pendingItems,
+    ],
+    results: [
+      ...normalizedState.successItems.map((item) => ({ item, status: "成功" })),
+      ...normalizedState.retryItems.map((entry) => ({
+        item: entry.item,
+        status: entry.reason,
+      })),
+    ],
+  };
+}
+
+function getStateSnapshot() {
+  syncDerivedState();
+  return {
+    ...state,
+    progress: getQueueProgress(state),
+  };
+}
+
+async function persistState() {
+  syncDerivedState();
+  await chrome.storage.local.set({ [STORAGE_KEY]: state });
+}
+
+function hydrateState(savedState) {
+  const baseState = {
+    ...createInitialState(),
+    ...savedState,
+    isRunning: false,
+    isPaused: false,
+  };
+
+  if (
+    Array.isArray(savedState?.pendingItems) ||
+    Array.isArray(savedState?.successItems) ||
+    Array.isArray(savedState?.retryItems)
+  ) {
+    state = normalizeQueueState(baseState);
+    syncDerivedState();
+    return;
+  }
+
+  const dataList = normalizeItems(savedState?.dataList);
+  const currentIndex = Math.max(0, Number(savedState?.currentIndex) || 0);
+  const results = Array.isArray(savedState?.results) ? savedState.results : [];
+
+  state = {
+    ...baseState,
+    pendingItems: dataList.slice(currentIndex),
+    successItems: results
+      .filter((entry) => entry?.status === "成功")
+      .map((entry) => entry.item),
+    retryItems: results
+      .filter((entry) => entry?.status && entry.status !== "成功")
+      .map((entry) => ({
+        item: String(entry.item ?? "").trim(),
+        reason: String(entry.status ?? "失败"),
+      }))
+      .filter((entry) => entry.item.length > 0),
+  };
+
+  syncDerivedState();
+}
+
+const stateReady = (async () => {
+  try {
+    const saved = await chrome.storage.local.get(STORAGE_KEY);
+    if (saved[STORAGE_KEY]) {
+      hydrateState(saved[STORAGE_KEY]);
+    } else {
+      syncDerivedState();
+    }
+  } catch (err) {
+    console.warn("[XFGL][background] 恢复状态失败:", err);
+    syncDerivedState();
+  }
+})();
 
 // 日志
 const logs = [];
@@ -34,12 +143,14 @@ function broadcastLog(entry) {
 }
 
 function broadcastProgress() {
+  const snapshot = getStateSnapshot();
   chrome.runtime
     .sendMessage({
       type: "PROGRESS_UPDATE",
-      current: state.currentIndex,
-      total: state.dataList.length,
-      results: state.results,
+      current: snapshot.currentIndex,
+      total: snapshot.progress.total,
+      results: snapshot.results,
+      state: snapshot,
     })
     .catch(() => {});
 }
@@ -212,7 +323,8 @@ async function cleanupTransientTabs() {
 
 // 主流程：处理单条数据
 async function processOneItem(item) {
-  addLog(`[${state.currentIndex + 1}/${state.dataList.length}] 查询: ${item}`);
+  const progress = getQueueProgress(state);
+  addLog(`[${progress.done + 1}/${progress.total}] 查询: ${item}`);
 
   try {
     state.detailTabId = null;
@@ -231,8 +343,7 @@ async function processOneItem(item) {
 
     if (!result.hasData) {
       addLog(`❌ 无数据: ${item}`, "warn");
-      state.results.push({ item, status: "无数据" });
-      return false;
+      return { outcome: "retry", reason: "无数据" };
     }
 
     addLog("✅ 找到数据，点击查看...");
@@ -246,9 +357,8 @@ async function processOneItem(item) {
     const checkResult = await sendToContent("CHECK_DIALOG");
     if (checkResult.hasDialog) {
       addLog(`❌ 无数据: ${item}`, "warn");
-      state.results.push({ item, status: "无数据" });
       await sendToContent("CLOSE_DIALOG");
-      return false;
+      return { outcome: "retry", reason: "无数据" };
     }
 
     const detailTab = await waitForNewWorkflowTab(tabsBeforeView, {
@@ -294,147 +404,203 @@ async function processOneItem(item) {
     await cleanupTransientTabs();
     await sleep(state.intervalMs);
 
-    state.results.push({ item, status: "成功" });
     addLog(`✅ 完成: ${item}`, "ok");
-    return true;
+    return { outcome: "success" };
   } catch (err) {
     addLog(`处理失败: ${err.message}`, "error");
-    state.results.push({ item, status: "失败: " + err.message });
-    return false;
+    return { outcome: "retry", reason: "失败: " + err.message };
   }
 }
 
 // 主循环
 async function runLoop() {
+  await stateReady;
   if (!state.isRunning || state.isPaused) return;
 
-  while (
-    state.currentIndex < state.dataList.length &&
-    state.isRunning &&
-    !state.isPaused
-  ) {
-    const item = state.dataList[state.currentIndex];
-    await processOneItem(item);
-    state.currentIndex++;
+  while (getCurrentItem(state) && state.isRunning && !state.isPaused) {
+    const item = getCurrentItem(state);
+    const result = await processOneItem(item);
 
-    await chrome.storage.session.set({ state });
+    if (result.outcome === "success") {
+      state = markCurrentItemSuccess(state);
+    } else {
+      state = markCurrentItemRetry(state, result.reason);
+    }
+
+    await persistState();
     broadcastProgress();
   }
 
-  if (state.currentIndex >= state.dataList.length) {
-    addLog(`🎉 全部完成！共处理 ${state.dataList.length} 条数据`, "ok");
+  if (!getCurrentItem(state) && state.isRunning) {
+    const progress = getQueueProgress(state);
+    addLog(`🎉 全部完成！共处理 ${progress.total} 条数据`, "ok");
     state.isRunning = false;
     state.step = "done";
+    await persistState();
     broadcastProgress();
     chrome.runtime
-      .sendMessage({ type: "RUN_STATE_CHANGED", isRunning: false })
+      .sendMessage({
+        type: "RUN_STATE_CHANGED",
+        isRunning: false,
+        state: getStateSnapshot(),
+      })
       .catch(() => {});
   }
 }
 
 // 消息处理
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  switch (message.type) {
-    case "START":
-      if (state.isRunning) {
-        sendResponse({ ok: false, error: "流程已在运行中" });
+  (async () => {
+    await stateReady;
+
+    switch (message.type) {
+      case "START": {
+        if (state.isRunning) {
+          sendResponse({ ok: false, error: "流程已在运行中" });
+          return;
+        }
+
+        const nextData = normalizeItems(message.data);
+        if (nextData.length === 0) {
+          sendResponse({ ok: false, error: "请先粘贴数据" });
+          return;
+        }
+
+        const shouldResumeExisting =
+          state.pendingItems.length > 0 &&
+          state.pendingItems.length === nextData.length &&
+          state.pendingItems.every((item, index) => item === nextData[index]);
+
+        state = shouldResumeExisting
+          ? {
+              ...state,
+              queryType: message.queryType || state.queryType || "姓名",
+              printMode: message.printMode || state.printMode || "kiosk",
+              intervalMs: message.intervalMs || state.intervalMs || 3000,
+            }
+          : {
+              ...createInitialState(),
+              ...createQueueState(nextData),
+              queryType: message.queryType || "姓名",
+              printMode: message.printMode || "kiosk",
+              intervalMs: message.intervalMs || 3000,
+            };
+
+        state.isRunning = true;
+        state.isPaused = false;
+        state.detailTabId = null;
+        state.printTabId = null;
+        state.step = "running";
+
+        const total = getQueueProgress(state).total;
+        addLog(
+          `${shouldResumeExisting ? "继续" : "开始"}处理 ${total} 条数据 (${state.queryType}，打印方式: ${state.printMode})`,
+        );
+        await persistState();
+        broadcastProgress();
+
+        getOrCreateTab()
+          .then(async (tab) => {
+            state.tabId = tab.id;
+            await persistState();
+            addLog(`已获取查询页标签 ID: ${tab.id}`);
+            await waitForContentScript(tab.id);
+            runLoop();
+          })
+          .catch(async (err) => {
+            addLog(`启动失败: ${err.message}`, "error");
+            state.isRunning = false;
+            state.step = "idle";
+            await persistState();
+            chrome.runtime
+              .sendMessage({
+                type: "RUN_STATE_CHANGED",
+                isRunning: false,
+                state: getStateSnapshot(),
+              })
+              .catch(() => {});
+          });
+
+        sendResponse({ ok: true });
         return;
       }
-      if (!message.data || message.data.length === 0) {
-        sendResponse({ ok: false, error: "请先粘贴数据" });
+
+      case "STOP":
+        state.isRunning = false;
+        state.step = state.pendingItems.length > 0 ? "stopped" : state.step;
+        addLog("用户停止流程");
+        await persistState();
+        broadcastProgress();
+        chrome.runtime
+          .sendMessage({
+            type: "RUN_STATE_CHANGED",
+            isRunning: false,
+            state: getStateSnapshot(),
+          })
+          .catch(() => {});
+        sendResponse({ ok: true });
         return;
-      }
-      state.dataList = message.data;
-      state.currentIndex = 0;
-      state.queryType = message.queryType || "姓名";
-      state.printMode = message.printMode || "kiosk";
-      state.intervalMs = message.intervalMs || 3000;
-      state.isRunning = true;
-      state.isPaused = false;
-      state.results = [];
-      state.detailTabId = null;
-      state.printTabId = null;
-      state.step = "running";
-      addLog(
-        `开始处理 ${state.dataList.length} 条数据 (${state.queryType}，打印方式: ${state.printMode})`,
-      );
-      chrome.storage.session.set({ state });
 
-      getOrCreateTab()
-        .then(async (tab) => {
-          state.tabId = tab.id;
-          addLog(`已获取查询页标签 ID: ${tab.id}`);
-          await waitForContentScript(tab.id);
-          runLoop();
-        })
-        .catch((err) => {
-          addLog(`启动失败: ${err.message}`, "error");
-          state.isRunning = false;
-        });
+      case "PAUSE":
+        state.isPaused = true;
+        addLog("流程已暂停");
+        await persistState();
+        sendResponse({ ok: true });
+        return;
 
-      sendResponse({ ok: true });
-      break;
+      case "RESUME":
+        state.isPaused = false;
+        state.isRunning = true;
+        addLog("流程继续");
+        await persistState();
+        runLoop();
+        sendResponse({ ok: true });
+        return;
 
-    case "STOP":
-      state.isRunning = false;
-      addLog("用户停止流程");
-      chrome.storage.session.set({ state });
-      sendResponse({ ok: true });
-      break;
+      case "GET_STATE":
+        sendResponse({ ok: true, state: getStateSnapshot(), logs: logs.slice(-50) });
+        return;
 
-    case "PAUSE":
-      state.isPaused = true;
-      addLog("流程已暂停");
-      sendResponse({ ok: true });
-      break;
+      case "GET_LOGS":
+        sendResponse({ ok: true, logs });
+        return;
 
-    case "RESUME":
-      state.isPaused = false;
-      addLog("流程继续");
-      runLoop();
-      sendResponse({ ok: true });
-      break;
+      case "CONTENT_SCRIPT_READY":
+        if (sender.tab?.url?.startsWith(TARGET_URL)) {
+          state.tabId = sender.tab.id;
+          await persistState();
+        }
+        sendResponse({ ok: true });
+        return;
 
-    case "GET_STATE":
-      sendResponse({ ok: true, state, logs: logs.slice(-50) });
-      break;
+      case "LOG":
+      case "STEP_COMPLETE":
+      case "STEP_ERROR":
+        addLog(
+          `[${message.source || "system"}] ${message.payload?.message || message.step || ""}`,
+          message.payload?.level || "info",
+        );
+        sendResponse({ ok: true });
+        return;
 
-    case "GET_LOGS":
-      sendResponse({ ok: true, logs });
-      break;
+      case "PING":
+        sendResponse({ ok: true });
+        return;
 
-    case "CONTENT_SCRIPT_READY":
-      if (sender.tab?.url?.startsWith(TARGET_URL)) {
-        state.tabId = sender.tab.id;
-      }
-      sendResponse({ ok: true });
-      break;
+      default:
+        sendResponse({ ok: false, error: "未知消息类型" });
+    }
+  })().catch((err) => {
+    console.error("[XFGL][background] 消息处理失败:", err);
+    sendResponse({ ok: false, error: err.message });
+  });
 
-    case "LOG":
-    case "STEP_COMPLETE":
-    case "STEP_ERROR":
-      addLog(
-        `[${message.source || "system"}] ${message.payload?.message || message.step || ""}`,
-        message.payload?.level || "info",
-      );
-      sendResponse({ ok: true });
-      break;
-
-    case "PING":
-      sendResponse({ ok: true });
-      break;
-
-    default:
-      sendResponse({ ok: false, error: "未知消息类型" });
-  }
+  return true;
 });
 
 // 初始化时恢复状态
 chrome.runtime.onStartup.addListener(async () => {
-  const saved = await chrome.storage.session.get("state");
-  if (saved.state) {
-    state = { ...state, ...saved.state, isRunning: false };
-  }
+  await stateReady;
 });
 
 chrome.runtime.onInstalled.addListener(() => {

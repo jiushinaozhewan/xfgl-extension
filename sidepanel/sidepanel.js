@@ -5,6 +5,7 @@ const btnStart = document.getElementById("btnStart");
 const btnStop = document.getElementById("btnStop");
 const queryType = document.getElementById("queryType");
 const dataInput = document.getElementById("dataInput");
+const retryInput = document.getElementById("retryInput");
 const intervalInput = document.getElementById("intervalInput");
 const printMode = document.getElementById("printMode");
 const progressFill = document.getElementById("progressFill");
@@ -15,6 +16,7 @@ const statFail = document.getElementById("statFail");
 const statPending = document.getElementById("statPending");
 
 let isRunning = false;
+let latestState = null;
 
 // 添加日志
 function addLog(message, level = "info") {
@@ -26,27 +28,69 @@ function addLog(message, level = "info") {
   logContainer.scrollTop = logContainer.scrollHeight;
 }
 
+function getProgress(state = {}) {
+  const success = Array.isArray(state.successItems) ? state.successItems.length : 0;
+  const fail = Array.isArray(state.retryItems) ? state.retryItems.length : 0;
+  const pending = Array.isArray(state.pendingItems) ? state.pendingItems.length : 0;
+  const total = success + fail + pending;
+  const done = success + fail;
+
+  return { total, done, success, fail, pending };
+}
+
+function formatRetryItems(retryItems = []) {
+  return retryItems
+    .map((entry) => `${entry.item} ｜ ${entry.reason}`)
+    .join("\n");
+}
+
+function setStartButtonText() {
+  const hasPending = Array.isArray(latestState?.pendingItems) && latestState.pendingItems.length > 0;
+  btnStart.textContent = !isRunning && hasPending ? "▶ 继续" : "▶ 开始";
+}
+
+function applyRunningState(running) {
+  isRunning = running;
+  btnStart.disabled = running;
+  btnStop.disabled = !running;
+  dataInput.disabled = running;
+  queryType.disabled = running;
+  printMode.disabled = running;
+  intervalInput.disabled = running;
+  setStartButtonText();
+}
+
 // 更新进度
-function updateProgress(current, total, results = []) {
-  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+function renderState(state = {}) {
+  latestState = state;
+
+  const progress = state.progress || getProgress(state);
+  const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
   progressFill.style.width = `${pct}%`;
-  progressText.textContent = `${current} / ${total}`;
+  progressText.textContent = `${progress.done} / ${progress.total}`;
 
-  const success = results.filter((r) => r.status === "成功").length;
-  const fail = results.filter((r) => r.status !== "成功").length;
-  const pending = total - current;
+  statSuccess.textContent = progress.success;
+  statFail.textContent = progress.fail;
+  statPending.textContent = progress.pending;
 
-  statSuccess.textContent = success;
-  statFail.textContent = fail;
-  statPending.textContent = pending;
+  dataInput.value = Array.isArray(state.pendingItems)
+    ? state.pendingItems.join("\n")
+    : "";
+  retryInput.value = Array.isArray(state.retryItems)
+    ? formatRetryItems(state.retryItems)
+    : "";
 
-  if (current === 0) {
+  if (state.isRunning) {
+    statusText.textContent = "处理中...";
+  } else if (progress.total === 0) {
     statusText.textContent = "等待开始";
-  } else if (current >= total) {
+  } else if (progress.pending === 0) {
     statusText.textContent = "全部完成";
   } else {
-    statusText.textContent = `处理中...`;
+    statusText.textContent = "已停止，可继续";
   }
+
+  applyRunningState(Boolean(state.isRunning));
 }
 
 // 解析数据
@@ -65,12 +109,7 @@ btnStart.addEventListener("click", async () => {
     return;
   }
 
-  isRunning = true;
-  btnStart.disabled = true;
-  btnStop.disabled = false;
-  dataInput.disabled = true;
-  queryType.disabled = true;
-  printMode.disabled = true;
+  applyRunningState(true);
 
   addLog(`开始处理 ${data.length} 条数据 (${queryType.value})`, "info");
 
@@ -85,13 +124,13 @@ btnStart.addEventListener("click", async () => {
 
     if (!response.ok) {
       addLog(`启动失败: ${response.error}`, "error");
-      resetUI();
+      applyRunningState(false);
     } else {
       addLog("流程已启动", "ok");
     }
   } catch (err) {
     addLog(`启动失败: ${err.message}`, "error");
-    resetUI();
+    applyRunningState(false);
   }
 });
 
@@ -100,21 +139,10 @@ btnStop.addEventListener("click", async () => {
   try {
     await chrome.runtime.sendMessage({ type: "STOP" });
     addLog("已发送停止指令", "warn");
-    isRunning = false;
   } catch (err) {
     addLog(`停止失败: ${err.message}`, "error");
   }
 });
-
-// 重置UI
-function resetUI() {
-  btnStart.disabled = false;
-  btnStop.disabled = true;
-  dataInput.disabled = false;
-  queryType.disabled = false;
-  printMode.disabled = false;
-  isRunning = false;
-}
 
 // 监听来自 background 的消息
 chrome.runtime.onMessage.addListener((message) => {
@@ -124,13 +152,14 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 
   if (message.type === "PROGRESS_UPDATE") {
-    const { current, total, results } = message;
-    updateProgress(current, total, results);
+    renderState(message.state || {});
   }
 
   if (message.type === "RUN_STATE_CHANGED") {
+    if (message.state) {
+      renderState(message.state);
+    }
     if (!message.isRunning) {
-      resetUI();
       addLog("流程已结束", "ok");
     }
   }
@@ -141,23 +170,19 @@ async function init() {
   try {
     const response = await chrome.runtime.sendMessage({ type: "GET_STATE" });
     if (response.ok && response.state) {
-      const {
-        currentIndex,
-        dataList,
-        results,
-        isRunning: running,
-      } = response.state;
-      if (running && dataList.length > 0) {
-        updateProgress(currentIndex, dataList.length, results);
-        addLog(`恢复进度: ${currentIndex}/${dataList.length}`, "warn");
-        isRunning = true;
-        btnStart.disabled = true;
-        btnStop.disabled = false;
-        dataInput.disabled = true;
-        queryType.disabled = true;
-        printMode.disabled = true;
-      } else if (dataList.length > 0) {
-        updateProgress(currentIndex, dataList.length, results);
+      const state = response.state;
+      queryType.value = state.queryType || queryType.value;
+      printMode.value = state.printMode || printMode.value;
+      intervalInput.value = String(
+        Math.max(0, Math.round((state.intervalMs || 3000) / 1000)),
+      );
+      renderState(state);
+
+      const progress = state.progress || getProgress(state);
+      if (state.isRunning && progress.total > 0) {
+        addLog(`恢复进度: ${progress.done}/${progress.total}`, "warn");
+      } else if (progress.pending > 0) {
+        addLog(`发现剩余 ${progress.pending} 条待处理数据，点击“继续”可恢复流程`, "warn");
       }
     }
   } catch (err) {
