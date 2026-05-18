@@ -265,7 +265,6 @@ function getSearchableDocuments(root = document) {
 
   return docs;
 }
-
 function findButtonByText(text, options = {}) {
   const { exact = true, root = document, includeFrames = false } = options;
   const expectedText = normalizeText(text);

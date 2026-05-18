@@ -1,10 +1,22 @@
 // background.js — XFGL 学分查询自动化扩展后台服务
 
-importScripts("lib/queue-state.js");
+importScripts("lib/queue-state.js", "lib/output-mode.js");
 
 const TARGET_URL =
-  "http://xsgl.jyt.henan.gov.cn/xfgl/credit/newsubject/newsubjectBF";
-const SITE_URL_PATTERN = "http://xsgl.jyt.henan.gov.cn/*";
+  "https://xsgl.jyt.henan.gov.cn/xfgl/credit/newsubject/newsubjectBF";
+const LOCAL_SAVE_NATIVE_HOST = "com.xfgl.save_dialog";
+const QUERY_PAGE_URL_PREFIXES = [
+  "http://xsgl.jyt.henan.gov.cn/xfgl/credit/newsubject/newsubjectBF",
+  "https://xsgl.jyt.henan.gov.cn/xfgl/credit/newsubject/newsubjectBF",
+];
+const QUERY_PAGE_URL_PATTERNS = QUERY_PAGE_URL_PREFIXES.map(
+  (prefix) => `${prefix}*`,
+);
+const SITE_URL_PATTERNS = [
+  "http://xsgl.jyt.henan.gov.cn/*",
+  "https://xsgl.jyt.henan.gov.cn/*",
+];
+const CONTENT_SCRIPT_FILES = ["content/utils.js", "content/query-page.js"];
 const STORAGE_KEY = "state";
 
 const {
@@ -16,6 +28,7 @@ const {
   normalizeItems,
   normalizeQueueState,
 } = globalThis.QueueState;
+const { normalizeOutputMode, sanitizeFileName } = globalThis.OutputMode;
 
 function createInitialState() {
   return {
@@ -27,6 +40,7 @@ function createInitialState() {
     currentIndex: 0,
     queryType: "姓名",
     printMode: "kiosk",
+    outputMode: "direct",
     results: [],
     tabId: null,
     detailTabId: null,
@@ -79,6 +93,7 @@ function hydrateState(savedState) {
   const baseState = {
     ...createInitialState(),
     ...savedState,
+    outputMode: normalizeOutputMode(savedState?.outputMode),
     isRunning: false,
     isPaused: false,
   };
@@ -157,7 +172,7 @@ function broadcastProgress() {
 
 // 查找或创建查询页标签
 async function getOrCreateTab() {
-  const tabs = await chrome.tabs.query({ url: TARGET_URL + "*" });
+  const tabs = await chrome.tabs.query({ url: QUERY_PAGE_URL_PATTERNS });
   if (tabs.length > 0) {
     return tabs[0];
   }
@@ -165,7 +180,7 @@ async function getOrCreateTab() {
 }
 
 async function listWorkflowTabs() {
-  return chrome.tabs.query({ url: SITE_URL_PATTERN });
+  return chrome.tabs.query({ url: SITE_URL_PATTERNS });
 }
 
 async function listAllTabs() {
@@ -179,52 +194,123 @@ async function snapshotWorkflowTabIds() {
   );
 }
 
-async function snapshotAllTabIds() {
-  const tabs = await listAllTabs();
-  return new Set(
-    tabs.map((tab) => tab.id).filter((tabId) => Number.isInteger(tabId)),
-  );
-}
-
-// 发送消息到 content script
-async function sendToContent(type, data = {}, tabId = state.tabId) {
-  if (!tabId) throw new Error("无活动标签页");
-  const timeoutMs = data.timeoutMs || 15000;
-
-  const response = await Promise.race([
-    chrome.tabs.sendMessage(tabId, { type, ...data }),
-    new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new Error(`消息超时: ${type} (tab ${tabId})`));
-      }, timeoutMs);
-    }),
-  ]);
-
-  if (response?.ok === false) {
-    throw new Error(response.error || `内容脚本执行失败: ${type}`);
-  }
-
-  return response;
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isSiteUrl(url = "") {
+  return SITE_URL_PATTERNS.some((pattern) =>
+    url.startsWith(pattern.replace("*", "")),
+  );
+}
+
+function isMissingReceiverError(error) {
+  const message = String(error?.message || error || "");
+  return (
+    message.includes("Receiving end does not exist") ||
+    message.includes("Could not establish connection")
+  );
+}
+
+async function sendMessageWithTimeout(tabId, payload, timeoutMs) {
+  return Promise.race([
+    chrome.tabs.sendMessage(tabId, payload),
+    new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`消息超时: ${payload.type} (tab ${tabId})`));
+      }, timeoutMs);
+    }),
+  ]);
+}
+
+async function injectContentScripts(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab?.id) {
+    addLog(`无法注入内容脚本：标签页不存在 (tab ${tabId})`, "warn");
+    return false;
+  }
+
+  if (!isSiteUrl(tab.url || "")) {
+    addLog(`跳过内容脚本注入：页面地址不匹配 ${tab.url || "未知地址"}`, "warn");
+    return false;
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: CONTENT_SCRIPT_FILES,
+  });
+  addLog(`已补注入内容脚本 (tab ${tabId})`);
+  return true;
+}
+
 // 等待 content script 就绪
-async function waitForContentScript(tabId = state.tabId) {
-  for (let i = 0; i < 20; i++) {
+async function waitForContentScript(
+  tabId = state.tabId,
+  options = {},
+) {
+  const {
+    attempts = 20,
+    intervalMs = 1000,
+    allowInjection = true,
+  } = options;
+
+  let injected = false;
+
+  for (let i = 0; i < attempts; i++) {
     try {
       const res = await chrome.tabs.sendMessage(tabId, { type: "PING" });
       if (res?.ok) {
         addLog(`内容脚本已就绪 (tab ${tabId})`);
         return true;
       }
-    } catch (_) {}
-    await sleep(1000);
+    } catch (err) {
+      if (allowInjection && !injected && isMissingReceiverError(err)) {
+        try {
+          injected = await injectContentScripts(tabId);
+        } catch (injectErr) {
+          addLog(`补注入内容脚本失败: ${injectErr.message}`, "warn");
+        }
+      }
+    }
+    await sleep(intervalMs);
   }
-  addLog(`内容脚本未响应，继续执行 (tab ${tabId})`, "warn");
+
+  addLog(`内容脚本未就绪，停止当前流程 (tab ${tabId})`, "error");
   return false;
+}
+
+// 发送消息到 content script
+async function sendToContent(type, data = {}, tabId = state.tabId) {
+  if (!tabId) throw new Error("无活动标签页");
+  const timeoutMs = data.timeoutMs || 15000;
+  const payload = { type, ...data };
+
+  let response;
+
+  try {
+    response = await sendMessageWithTimeout(tabId, payload, timeoutMs);
+  } catch (err) {
+    if (!isMissingReceiverError(err)) {
+      throw err;
+    }
+
+    const ready = await waitForContentScript(tabId, {
+      attempts: 5,
+      intervalMs: 500,
+      allowInjection: true,
+    });
+    if (!ready) {
+      throw new Error(`内容脚本未就绪: ${type} (tab ${tabId})`);
+    }
+
+    response = await sendMessageWithTimeout(tabId, payload, timeoutMs);
+  }
+
+  if (response?.ok === false) {
+    throw new Error(response.error || `内容脚本执行失败: ${type}`);
+  }
+
+  return response;
 }
 
 async function waitForNewWorkflowTab(beforeIds, options = {}) {
@@ -243,40 +329,6 @@ async function waitForNewWorkflowTab(beforeIds, options = {}) {
         if (Boolean(a.active) !== Boolean(b.active)) {
           return a.active ? -1 : 1;
         }
-        return (b.id || 0) - (a.id || 0);
-      });
-      return candidates[0];
-    }
-
-    await sleep(300);
-  }
-
-  return null;
-}
-
-async function waitForNewTab(beforeIds, options = {}) {
-  const { timeout = 8000, excludeIds = [], preferredOpenerTabId = null } = options;
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < timeout) {
-    const tabs = await listAllTabs();
-    const candidates = tabs
-      .filter((tab) => Number.isInteger(tab.id))
-      .filter((tab) => !beforeIds.has(tab.id))
-      .filter((tab) => !excludeIds.includes(tab.id));
-
-    if (candidates.length > 0) {
-      candidates.sort((a, b) => {
-        const aScore =
-          (preferredOpenerTabId && a.openerTabId === preferredOpenerTabId ? 4 : 0) +
-          (a.active ? 2 : 0) +
-          ((a.url || "").startsWith("http://xsgl.jyt.henan.gov.cn/") ? 1 : 0);
-        const bScore =
-          (preferredOpenerTabId && b.openerTabId === preferredOpenerTabId ? 4 : 0) +
-          (b.active ? 2 : 0) +
-          ((b.url || "").startsWith("http://xsgl.jyt.henan.gov.cn/") ? 1 : 0);
-
-        if (aScore !== bScore) return bScore - aScore;
         return (b.id || 0) - (a.id || 0);
       });
       return candidates[0];
@@ -319,6 +371,29 @@ async function cleanupTransientTabs() {
   try {
     await sendToContent("CLOSE_DETAIL_AND_RETURN");
   } catch (_) {}
+}
+
+async function saveLocalFile(fileName) {
+  let response;
+
+  try {
+    response = await chrome.runtime.sendNativeMessage(LOCAL_SAVE_NATIVE_HOST, {
+      type: "savePdf",
+      fileName,
+      timeoutMs: 15000,
+      windowTitleIncludes: "综合学分查询",
+    });
+  } catch (error) {
+    throw new Error(
+      `本地保存辅助程序不可用，请先运行 native/install-native-host.ps1 完成安装: ${error.message}`,
+    );
+  }
+
+  if (!response?.ok) {
+    throw new Error(response?.error || "本地保存辅助程序执行失败");
+  }
+
+  return response;
 }
 
 // 主流程：处理单条数据
@@ -375,6 +450,11 @@ async function processOneItem(item) {
     }
 
     const detailTargetTabId = state.detailTabId || state.tabId;
+    let exportFileName = null;
+
+    if (state.outputMode === "save-local") {
+      exportFileName = sanitizeFileName(item, "未命名");
+    }
 
     // Step 5: 点击打印
     addLog("📋 进入详情页，点击“点击打印”...");
@@ -385,7 +465,12 @@ async function processOneItem(item) {
     );
     await sleep(1000);
 
-    if (state.printMode === "kiosk") {
+    if (state.outputMode === "save-local") {
+      addLog(`准备本地保存，文件名: ${exportFileName}`);
+      const saveResult = await saveLocalFile(exportFileName);
+      addLog(`已完成本地保存: ${saveResult.fileName}`, "ok");
+      await sleep(800);
+    } else if (state.printMode === "kiosk") {
       addLog(
         "已触发打印。若浏览器使用 --kiosk-printing 启动，将自动确认最终打印。",
         "ok",
@@ -476,6 +561,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               ...state,
               queryType: message.queryType || state.queryType || "姓名",
               printMode: message.printMode || state.printMode || "kiosk",
+              outputMode: normalizeOutputMode(
+                message.outputMode || state.outputMode,
+              ),
               intervalMs: message.intervalMs || state.intervalMs || 3000,
             }
           : {
@@ -483,6 +571,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               ...createQueueState(nextData),
               queryType: message.queryType || "姓名",
               printMode: message.printMode || "kiosk",
+              outputMode: normalizeOutputMode(message.outputMode),
               intervalMs: message.intervalMs || 3000,
             };
 
@@ -494,7 +583,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         const total = getQueueProgress(state).total;
         addLog(
-          `${shouldResumeExisting ? "继续" : "开始"}处理 ${total} 条数据 (${state.queryType}，打印方式: ${state.printMode})`,
+          `${shouldResumeExisting ? "继续" : "开始"}处理 ${total} 条数据 (${state.queryType}，打印方式: ${state.printMode}，输出方式: ${state.outputMode})`,
         );
         await persistState();
         broadcastProgress();
@@ -504,7 +593,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             state.tabId = tab.id;
             await persistState();
             addLog(`已获取查询页标签 ID: ${tab.id}`);
-            await waitForContentScript(tab.id);
+            const ready = await waitForContentScript(tab.id, {
+              allowInjection: true,
+            });
+            if (!ready) {
+              throw new Error("查询页内容脚本未就绪");
+            }
             runLoop();
           })
           .catch(async (err) => {
@@ -566,7 +660,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
 
       case "CONTENT_SCRIPT_READY":
-        if (sender.tab?.url?.startsWith(TARGET_URL)) {
+        if (
+          QUERY_PAGE_URL_PREFIXES.some((prefix) =>
+            sender.tab?.url?.startsWith(prefix),
+          )
+        ) {
           state.tabId = sender.tab.id;
           await persistState();
         }

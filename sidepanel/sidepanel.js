@@ -8,6 +8,7 @@ const dataInput = document.getElementById("dataInput");
 const retryInput = document.getElementById("retryInput");
 const intervalInput = document.getElementById("intervalInput");
 const printMode = document.getElementById("printMode");
+const outputMode = document.getElementById("outputMode");
 const progressFill = document.getElementById("progressFill");
 const progressText = document.getElementById("progressText");
 const statusText = document.getElementById("statusText");
@@ -56,6 +57,7 @@ function applyRunningState(running) {
   dataInput.disabled = running;
   queryType.disabled = running;
   printMode.disabled = running;
+  outputMode.disabled = running;
   intervalInput.disabled = running;
   setStartButtonText();
 }
@@ -79,6 +81,7 @@ function renderState(state = {}) {
   retryInput.value = Array.isArray(state.retryItems)
     ? formatRetryItems(state.retryItems)
     : "";
+  outputMode.value = state.outputMode || outputMode.value;
 
   if (state.isRunning) {
     statusText.textContent = "处理中...";
@@ -120,6 +123,7 @@ btnStart.addEventListener("click", async () => {
       queryType: queryType.value,
       intervalMs: (parseInt(intervalInput.value) || 3) * 1000,
       printMode: printMode.value,
+      outputMode: outputMode.value,
     });
 
     if (!response.ok) {
@@ -173,6 +177,7 @@ async function init() {
       const state = response.state;
       queryType.value = state.queryType || queryType.value;
       printMode.value = state.printMode || printMode.value;
+      outputMode.value = state.outputMode || outputMode.value;
       intervalInput.value = String(
         Math.max(0, Math.round((state.intervalMs || 3000) / 1000)),
       );

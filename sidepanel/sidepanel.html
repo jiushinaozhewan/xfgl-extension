@@ -187,6 +187,15 @@
       若要全自动，请用带 <code>--kiosk-printing</code> 的 Chrome/Edge 启动。
     </div>
 
+    <label style="margin-top: 12px;">输出方式</label>
+    <select id="outputMode">
+      <option value="direct">直接出表</option>
+      <option value="save-local">本地保存</option>
+    </select>
+    <div class="hint">
+      选择“本地保存”时，扩展会调用本机保存辅助程序，在系统“另存为”窗口里自动填入当前查询值并点击“保存”。
+    </div>
+
     <label style="margin-top: 12px;">数据列表（每行一个）</label>
     <textarea id="dataInput" placeholder="粘贴数据，例如：&#10;张三&#10;李四&#10;王五"></textarea>
     <div class="hint">

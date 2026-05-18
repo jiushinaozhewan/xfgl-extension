@@ -3,8 +3,18 @@
   "name": "学分查询自动化",
   "version": "1.0.0",
   "description": "批量查询学生学分信息并打印",
-  "permissions": ["sidePanel", "tabs", "storage", "scripting", "activeTab"],
-  "host_permissions": ["http://xsgl.jyt.henan.gov.cn/*"],
+  "permissions": [
+    "sidePanel",
+    "tabs",
+    "storage",
+    "scripting",
+    "activeTab",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "http://xsgl.jyt.henan.gov.cn/*",
+    "https://xsgl.jyt.henan.gov.cn/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
@@ -13,7 +23,10 @@
   },
   "content_scripts": [
     {
-      "matches": ["http://xsgl.jyt.henan.gov.cn/*"],
+      "matches": [
+        "http://xsgl.jyt.henan.gov.cn/*",
+        "https://xsgl.jyt.henan.gov.cn/*"
+      ],
       "js": ["content/utils.js", "content/query-page.js"],
       "run_at": "document_idle",
       "match_about_blank": true,

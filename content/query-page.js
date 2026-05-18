@@ -191,6 +191,27 @@ function getPrintDialogRoot() {
   return matched.at(-1) || null;
 }
 
+let originalDocumentTitle = null;
+
+function setExportFileNameTitle(fileName) {
+  if (originalDocumentTitle === null) {
+    originalDocumentTitle = document.title;
+  }
+
+  document.title = fileName;
+  log(`已设置导出文件名标题: ${fileName}`);
+}
+
+function restoreDocumentTitle() {
+  if (originalDocumentTitle === null) {
+    return;
+  }
+
+  document.title = originalDocumentTitle;
+  originalDocumentTitle = null;
+  log("已恢复页面标题");
+}
+
 async function triggerClickPrint() {
   await clickButtonByText("点击打印", {
     exact: true,
@@ -287,6 +308,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             log(`当前页可见按钮: ${pageButtons || "无"}`, "warn");
             throw new Error(`未找到“打印”按钮: ${error.message}`);
           }
+          sendResponse({ ok: true });
+          break;
+
+        case "SET_EXPORT_FILE_NAME":
+          setExportFileNameTitle(message.fileName);
+          sendResponse({ ok: true });
+          break;
+
+        case "RESTORE_DOCUMENT_TITLE":
+          restoreDocumentTitle();
           sendResponse({ ok: true });
           break;
 
