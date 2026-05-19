@@ -1,0 +1,9 @@
+﻿{
+    "path":  "D:\\meta\\xfgl-extension\\native\\XfglSaveDialogHost.exe",
+    "description":  "XFGL 本地保存辅助程序",
+    "name":  "com.xfgl.save_dialog",
+    "allowed_origins":  [
+                            "chrome-extension://cojlopnpkhbgmenaklkhdfccldbjdakn/"
+                        ],
+    "type":  "stdio"
+}
